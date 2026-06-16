@@ -5,3 +5,4 @@ opencv-python
 torch
 torchvision
 torchmetrics
+open3d

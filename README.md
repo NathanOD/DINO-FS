@@ -1,4 +1,4 @@
-# DINO-SAM-FS
+# DINO Few-Shot
 
 ## Installation
 
