@@ -11,3 +11,22 @@ proto_path: "prototypes/prototypes_vithplus.pkl"
 tau: 0.5
 min_area: 200
 morph_kernel: 5
+
+# Depth
+depth_scale: 0.001  # multiply raw depth values to get metres (0.001 = uint16 mm)
+
+# Geometric segmentation — all distances in metres
+geometry:
+  normal_k: 30
+  normal_radius: 0.05
+  distance_threshold: 0.001   # RANSAC inlier distance (~1 mm)
+  n_ransac_iterations: 1000
+  prefer_vertical: true
+  vertical_axis: 2             # 0=X  1=Y  2=Z
+  min_height: 0.002            # minimum height above base to be a stud candidate
+  dbscan_eps: 0.005
+  dbscan_min_samples: 10
+  min_stud_points: 50
+  use_normal_criterion: false
+  normal_perp_threshold: 0.5
+  normal_perp_min_fraction: 0.30

@@ -6,10 +6,13 @@ dinov3/
 
 # Weights
 weights/
+prototypes/
 
 # Images
 dataset/
 queries/
+test/
 
 *.zip
 *.png
+*.ply

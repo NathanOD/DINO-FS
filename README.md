@@ -23,5 +23,5 @@ python build_proto.py --dataset_dir dataset --config configs/config_vitl.yaml
 Inference
 
 ```shell
-python inference.py --config configs/config_vitl.yaml --query queries/image_0019.png --out_path result.png
+python inference.py --config configs/config_vitl.yaml --query test/image_00.png --intrinsics test/intrinsics.json
 ```
