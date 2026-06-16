@@ -58,9 +58,10 @@ def save_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Few-shot segmentation inference with saved prototypes")
     parser.add_argument("--query",      required=True, help="Query image path (must contain 'image' in filename)")
-    parser.add_argument("--intrinsics", required=True, help="Camera intrinsics JSON (fx, fy, cx, cy[, depth_scale])")
+    parser.add_argument("--intrinsics", required=True, help="Camera intrinsics JSON (fx, fy, cx, cy, depth_scale)")
     parser.add_argument("--config",     default="configs/config_vitb.yaml")
     parser.add_argument("--gt_mask",    default=None,  help="GT mask (optional, for IoU)")
+    parser.add_argument("--hand_eye",   default="test/hand_eye.json", help="Hand-eye calibration JSON (T_gc)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -111,11 +112,22 @@ def main() -> None:
     print(f"Inference time: {end_time - start_time:.2f}s")
     overlay_mask(query_rgb, pred_mask, alpha=0.5, color=(0, 255, 0), save_path="result.png")
 
+    with open(args.hand_eye) as f:
+        T_gc = np.array(json.load(f)["T_gc"], dtype=np.float64)
+
+    pose_path = args.query.replace("image", "pose").replace(".png", ".txt")
+    with open(pose_path) as f:
+        raw = f.read()
+    rows = [r.strip() for r in raw.strip().strip("[];").split(";") if r.strip()]
+    T_robot = np.array([[float(v) for v in r.split(",")] for r in rows], dtype=np.float64)
+    T_total = T_robot @ T_gc
+
     depth_path = args.query.replace("image", "depth")
     depth_raw = np.array(Image.open(depth_path))
     points, colors = mask_to_pointcloud(
         pred_mask, depth_raw, query_rgb, fx, fy, cx, cy, depth_scale
     )
+    points = (T_total[:3, :3] @ points.T).T + T_total[:3, 3]
     save_ply("result.ply", points, colors)
 
     if args.gt_mask is not None:
