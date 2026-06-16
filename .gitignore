@@ -1,0 +1,15 @@
+# Cache files
+__pycache__/
+
+# DINO
+dinov3/
+
+# Weights
+weights/
+
+# Images
+dataset/
+queries/
+
+*.zip
+*.png
