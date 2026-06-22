@@ -11,7 +11,7 @@ prototypes/
 # Images
 dataset/
 queries/
-test/
+test*/
 
 *.zip
 *.png
