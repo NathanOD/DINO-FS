@@ -23,10 +23,12 @@ Prototype Generation
 
 ```shell
 python build_proto.py --dataset_dir dataset2 --config configs/config_vitl.yaml
+python build_proto.py --dataset_dir dataset2 --config configs/config_vithplus.yaml
 ```
 
 Inference
 
 ```shell
 python inference.py --config configs/config_vitl.yaml --query test/image_00.png
+python inference.py --config configs/config_vithplus.yaml --query test/image_00.png
 ```

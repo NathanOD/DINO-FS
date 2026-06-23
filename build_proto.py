@@ -25,7 +25,7 @@ def main() -> None:
     print(f"Device: {device}  |  img_size: {img_size}  |  layers: {n_layers}")
 
     print("Loading DINOv3 encoder")
-    dino_encoder = torch.hub.load("dinov3", config["dino_model"], source="local").to(device)
+    dino_encoder = torch.hub.load("dinov3", model=config["dino_model"], source="local", weights=config["dino_weights"]).to(device)
     dino_encoder.eval()
 
     naf_scale = config.get("naf_scale", 1)
