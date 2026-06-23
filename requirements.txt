@@ -6,3 +6,5 @@ torch
 torchvision
 torchmetrics
 open3d
+einops
+kornia

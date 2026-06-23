@@ -24,16 +24,24 @@ def _l2_norm(x: np.ndarray) -> np.ndarray:
     return x / np.maximum(norms, 1e-8)
 
 
-def _extract_features(dino_encoder, image_tensor: torch.Tensor, dino_num_layers: int) -> np.ndarray:
+def _extract_features(
+    dino_encoder,
+    image_tensor: torch.Tensor,
+    dino_num_layers: int,
+    naf_model=None,
+    naf_scale: int = 1,
+) -> np.ndarray:
     """
-    Run DINO on a single preprocessed image tensor.
+    Run DINO on a single preprocessed image tensor, optionally upsampled with NAF.
 
     Args:
         image_tensor: (1, 3, H, W) float32 torch.Tensor, already on the correct device.
         dino_num_layers: number of transformer layers (n parameter for get_intermediate_layers).
+        naf_model: optional NAF upsampler. If provided, features are upsampled by naf_scale.
+        naf_scale: spatial upsampling factor relative to the DINO patch grid (default 1 = no NAF).
 
     Returns:
-        feats: (Hp, Wp, D) float32 numpy array, L2-normalized per patch.
+        feats: (Hp*naf_scale, Wp*naf_scale, D) float32 numpy array, L2-normalized per patch.
     """
     with torch.no_grad():
         out = dino_encoder.get_intermediate_layers(
@@ -43,19 +51,17 @@ def _extract_features(dino_encoder, image_tensor: torch.Tensor, dino_num_layers:
             norm=True,
         )[-1]  # (1, D, Hp, Wp)
 
-    feats = out.squeeze(0).permute(1, 2, 0).float().cpu().numpy()  # (Hp, Wp, D)
+        if naf_model is not None and naf_scale > 1:
+            Hp, Wp = out.shape[-2:]
+            out = naf_model(image_tensor, out, (Hp * naf_scale, Wp * naf_scale))  # (1, D, Hp*s, Wp*s)
+
+    feats = out.squeeze(0).permute(1, 2, 0).float().cpu().numpy()  # (Hp', Wp', D)
     return _l2_norm(feats)
 
 
-def _downsample_mask(mask: np.ndarray, Hp: int, Wp: int) -> np.ndarray:
-    """
-    Resize a binary mask (H, W) to the patch grid (Hp, Wp).
-    A patch is labelled 'piece' when more than 50 % of its pixels are piece.
-    Uses INTER_AREA for correct area-averaging then thresholds at 0.5.
-    """
-    mask_f = mask.astype(np.float32)
-    resized = cv2.resize(mask_f, (Wp, Hp), interpolation=cv2.INTER_AREA)
-    return (resized > 0.5).astype(np.uint8)
+def _downsample_label_map(label_map: np.ndarray, Hp: int, Wp: int) -> np.ndarray:
+    """Resize an integer label map (H, W) to the patch grid (Hp, Wp) using nearest-neighbor."""
+    return cv2.resize(label_map, (Wp, Hp), interpolation=cv2.INTER_NEAREST)
 
 
 def _cluster(vecs: np.ndarray, k: int) -> np.ndarray:
@@ -72,6 +78,22 @@ def _cluster(vecs: np.ndarray, k: int) -> np.ndarray:
     return _l2_norm(km.cluster_centers_.astype(np.float32))
 
 
+def _morph_cleanup(mask: np.ndarray, kernel_size: int, min_area: int) -> np.ndarray:
+    """Open + close a binary mask, then discard small connected components."""
+    if kernel_size > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if min_area > 0:
+        out = np.zeros_like(mask)
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+        for lbl in range(1, n_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+                out[labels == lbl] = 1
+        return out
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -82,49 +104,60 @@ def build_prototypes(
     dino_num_layers: int,
     device,
     k: int = 5,
+    class_names: list[str] = ("piece",),
+    naf_model=None,
+    naf_scale: int = 1,
 ) -> dict:
     """
     Build multi-class prototypes from an annotated support set.
 
     Args:
-        support_set: list of (image_tensor, mask_np) where
+        support_set: list of (image_tensor, label_map) where
             image_tensor is (1, 3, H, W) float32 on *device*,
-            mask_np is (H_orig, W_orig) uint8 with 1=piece, 0=background.
+            label_map is (H_orig, W_orig) uint8 with 0=background and i+1=class_names[i].
         dino_encoder: loaded DINOv3 model (eval mode).
         dino_num_layers: number of layers to pass to get_intermediate_layers.
         device: torch.device.
         k: number of prototypes per class (reduced if not enough samples).
+        class_names: ordered list of foreground class names, e.g. ["base", "welded"].
+            Label 1 maps to class_names[0], label 2 to class_names[1], etc.
 
     Returns:
-        {"piece": (Kp, D) float32, "background": (Kb, D) float32}
+        dict with one (K, D) array per class and "background", plus a merged "foreground"
+        prototype (all fg classes combined) and metadata keys "class_names" and "naf_scale".
     """
-    piece_pool, bg_pool = [], []
+    pools = {name: [] for name in class_names}
+    pools["background"] = []
+    fg_pool: list = []
 
-    for image_tensor, mask_np in support_set:
-        feats = _extract_features(dino_encoder, image_tensor, dino_num_layers)  # (Hp, Wp, D)
+    for i, (image_tensor, label_map) in enumerate(support_set):
+        feats = _extract_features(dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale)
         Hp, Wp, _ = feats.shape
-        patch_mask = _downsample_mask(mask_np, Hp, Wp)  # (Hp, Wp)
+        patch_labels = _downsample_label_map(label_map, Hp, Wp)  # (Hp, Wp) uint8
 
-        piece_vecs = feats[patch_mask == 1]
-        bg_vecs    = feats[patch_mask == 0]
+        fg_vecs = feats[patch_labels > 0]
+        if len(fg_vecs):
+            fg_pool.append(fg_vecs)
 
-        if len(piece_vecs):
-            piece_pool.append(piece_vecs)
+        for j, name in enumerate(class_names):
+            vecs = feats[patch_labels == j + 1]
+            if len(vecs):
+                pools[name].append(vecs)
+
+        bg_vecs = feats[patch_labels == 0]
         if len(bg_vecs):
-            bg_pool.append(bg_vecs)
+            pools["background"].append(bg_vecs)
 
-    if not piece_pool:
-        raise ValueError("No foreground patches found in support set — check your masks.")
-    if not bg_pool:
-        raise ValueError("No background patches found in support set — check your masks.")
+    protos: dict = {}
+    for name, pool in pools.items():
+        if not pool:
+            raise ValueError(f"No patches found for class '{name}' — check your masks.")
+        protos[name] = _cluster(np.concatenate(pool, axis=0), k)
 
-    piece_vecs = np.concatenate(piece_pool, axis=0)  # (N, D)
-    bg_vecs    = np.concatenate(bg_pool,    axis=0)  # (M, D)
-
-    return {
-        "piece":      _cluster(piece_vecs, k),  # (Kp, D)
-        "background": _cluster(bg_vecs,    k),  # (Kb, D)
-    }
+    protos["foreground"]  = _cluster(np.concatenate(fg_pool, axis=0), k)
+    protos["class_names"] = list(class_names)
+    protos["naf_scale"]   = naf_scale
+    return protos
 
 
 def save_prototypes(protos: dict, path: str) -> None:
@@ -148,6 +181,7 @@ def segment(
     tau: float = 0.5,
     min_area: int = 200,
     morph_kernel: int = 5,
+    naf_model=None,
 ) -> tuple:
     """
     Segment a query image using prototype cosine matching.
@@ -158,61 +192,69 @@ def segment(
         dino_encoder: loaded DINOv3 model (eval mode).
         dino_num_layers: number of layers passed to get_intermediate_layers.
         device: torch.device.
-        tau: confidence threshold on sim_piece (default 0.5).
+        tau: minimum absolute similarity for a foreground class to win over background.
         min_area: minimum connected-component area in pixels (at image resolution).
         morph_kernel: side of the elliptic morphological structuring element.
 
     Returns:
-        mask: (H, W) uint8 binary mask at image resolution (H, W same as image_tensor).
-        score_map: (Hp, Wp) float32 patch-resolution score map (sim_piece – sim_bg).
+        label_map: (H, W) uint8 — 0=background, i+1=class_names[i].
+        score_maps: dict {class_name: (Hp, Wp) float32} of sim(class) − sim(background).
     """
-    feats = _extract_features(dino_encoder, image_tensor, dino_num_layers)  # (Hp, Wp, D)
-    Hp, Wp, D = feats.shape
+    class_names = protos.get("class_names", ["piece"])
+    naf_scale   = protos.get("naf_scale", 1)
+
     H_img = image_tensor.shape[-2]
     W_img = image_tensor.shape[-1]
 
+    feats = _extract_features(dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale)
+    Hp, Wp, D = feats.shape
     flat = feats.reshape(-1, D).astype(np.float32)  # (N, D)
 
-    piece_protos = protos["piece"].astype(np.float32)       # (Kp, D)
-    bg_protos    = protos["background"].astype(np.float32)  # (Kb, D)
+    bg_protos = protos["background"].astype(np.float32)
+    sim_bg = (flat @ bg_protos.T).max(axis=1)  # (N,)
 
-    # Cosine similarity = dot product (all vectors already L2-normalized)
-    sim_piece = (flat @ piece_protos.T).max(axis=1)  # (N,) – best prototype per patch
-    sim_bg    = (flat @ bg_protos.T).max(axis=1)     # (N,)
+    # --- Stage 1: piece vs background ---
+    piece_mask: np.ndarray | None = None
+    if "foreground" in protos:
+        sim_fg = (flat @ protos["foreground"].astype(np.float32).T).max(axis=1)
+        piece_mask = sim_fg >= sim_bg
 
-    score_map     = (sim_piece - sim_bg).reshape(Hp, Wp).astype(np.float32)
-    sim_piece_map = sim_piece.reshape(Hp, Wp).astype(np.float32)
+    # --- Stage 2: per-class discrimination ---
+    sim_classes: dict[str, np.ndarray] = {}
+    score_maps: dict[str, np.ndarray] = {}
+    for name in class_names:
+        cls_protos = protos[name].astype(np.float32)
+        sim = (flat @ cls_protos.T).max(axis=1)  # (N,)
+        sim_classes[name] = sim
+        score_maps[name] = (sim - sim_bg).reshape(Hp, Wp).astype(np.float32)
 
-    # Bilinear upsample both maps to image resolution
-    def _upsample(arr: np.ndarray) -> np.ndarray:
-        t = torch.from_numpy(arr)[None, None]  # (1, 1, Hp, Wp)
-        up = F.interpolate(t, size=(H_img, W_img), mode="bilinear", align_corners=False)
-        return up.squeeze().numpy()
+    fg_sim_stack = np.stack([sim_classes[n] for n in class_names], axis=1)  # (N, C)
 
-    score_up     = _upsample(score_map)      # (H, W)
-    sim_piece_up = _upsample(sim_piece_map)  # (H, W)
-
-    # Threshold: piece if it beats background AND exceeds confidence
-    raw_mask = ((score_up > 0) & (sim_piece_up > tau)).astype(np.uint8)
-
-    # Morphological cleanup: open (remove noise) then close (fill holes)
-    if morph_kernel > 0:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (morph_kernel, morph_kernel)
-        )
-        cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN,  kernel)
-        cleaned = cv2.morphologyEx(cleaned,  cv2.MORPH_CLOSE, kernel)
+    if piece_mask is not None:
+        # Two-stage: stage 1 decided piece/bg, stage 2 picks best foreground class within piece.
+        fg_best = fg_sim_stack.argmax(axis=1) + 1  # (N,) — 1=base, 2=welded, ...
+        raw_labels = np.where(piece_mask, fg_best, 0).astype(np.uint8)
     else:
-        cleaned = raw_mask
+        # Single-stage fallback: winner-takes-all including background
+        sim_stack = np.stack([sim_bg] + [sim_classes[n] for n in class_names], axis=1)
+        raw_labels = sim_stack.argmax(axis=1)
+        win_sim = sim_stack[np.arange(len(raw_labels)), raw_labels]
+        raw_labels[(raw_labels > 0) & (win_sim < tau)] = 0
+        raw_labels = raw_labels.astype(np.uint8)
 
-    # Discard small connected components
-    final_mask = np.zeros_like(cleaned, dtype=np.uint8)
-    if min_area > 0:
-        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned)
-        for lbl in range(1, n_labels):
-            if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
-                final_mask[labels == lbl] = 1
-    else:
-        final_mask = cleaned
+    # Upsample label map to image resolution (nearest-neighbor preserves class ids)
+    raw_label_map = raw_labels.reshape(Hp, Wp).astype(np.uint8)
+    label_map_up = F.interpolate(
+        torch.from_numpy(raw_label_map).float()[None, None],
+        size=(H_img, W_img),
+        mode="nearest",
+    ).squeeze().byte().numpy()
 
-    return final_mask, score_map
+    # Morphological cleanup per class; background is whatever is unclaimed
+    final_label_map = np.zeros((H_img, W_img), dtype=np.uint8)
+    for j, name in enumerate(class_names):
+        cls_mask = (label_map_up == j + 1).astype(np.uint8)
+        cls_mask = _morph_cleanup(cls_mask, morph_kernel, min_area)
+        final_label_map[cls_mask > 0] = j + 1
+
+    return final_label_map, score_maps
