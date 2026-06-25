@@ -4,7 +4,7 @@
 
 ```shell
 git clone https://github.com/facebookresearch/dinov3.git
-````
+```
 
 ```shell
 conda create -n dinofs python=3.12

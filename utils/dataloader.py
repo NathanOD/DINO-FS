@@ -9,6 +9,42 @@ from pycocotools import mask as mask_utils
 from torchvision.transforms import v2
 
 
+def load_depth_paths(dataset_dir: str, annotation_file: str) -> list[str | None]:
+    """Return depth image paths matching each COCO image (None if file not found).
+
+    Convention: depth file = image filename with 'image_' replaced by 'depth_'.
+    Example: 'image_00.png' → 'depth_00.png'
+    """
+    with open(annotation_file) as f:
+        coco_data = json.load(f)
+    dataset_path = Path(dataset_dir)
+    paths = []
+    for img_info in coco_data["images"]:
+        fname = str(img_info["file_name"])
+        depth_fname = fname.replace("image_", "depth_")
+        depth_path = dataset_path / depth_fname
+        paths.append(str(depth_path) if depth_path.exists() else None)
+    return paths
+
+
+def load_pose_paths(dataset_dir: str, annotation_file: str) -> list[str | None]:
+    """Return robot pose file paths matching each COCO image (None if file not found).
+
+    Convention: pose file = image filename with 'image_' → 'pose_' and '.png' → '.txt'.
+    Example: 'image_00.png' → 'pose_00.txt'
+    """
+    with open(annotation_file) as f:
+        coco_data = json.load(f)
+    dataset_path = Path(dataset_dir)
+    paths = []
+    for img_info in coco_data["images"]:
+        fname = str(img_info["file_name"])
+        pose_fname = fname.replace("image_", "pose_").replace(".png", ".txt")
+        pose_path = dataset_path / pose_fname
+        paths.append(str(pose_path) if pose_path.exists() else None)
+    return paths
+
+
 def load_config(config_path: str) -> dict[str, Any]:
     """Load configuration from YAML file."""
     with open(config_path, 'r') as f:

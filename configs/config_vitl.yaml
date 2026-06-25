@@ -14,3 +14,11 @@ morph_kernel: 5
 
 # NAF
 naf_scale: 4
+
+# Depth geometry (RGB-D prototypes)
+handeye_config:    "configs/handeye.yaml"
+intrinsics_config: "configs/intrinsics.yaml"
+depth_alpha: 0.3    # weight for XYZ centroid channels
+depth_beta:  0.3    # weight for surface normal channels
+depth_gamma: 0.1    # weight for depth-std channel
+depth_scale: 1000.0 # mm normalization divisor (brings XYZ into ~[-1,1] range)

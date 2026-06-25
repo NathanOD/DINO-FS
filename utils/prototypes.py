@@ -30,18 +30,33 @@ def _extract_features(
     dino_num_layers: int,
     naf_model=None,
     naf_scale: int = 1,
+    geo_features: np.ndarray | None = None,
+    geo_weights: tuple[float, float, float] = (0.3, 0.3, 0.1),
+    depth_scale: float = 1000.0,
 ) -> np.ndarray:
     """
-    Run DINO on a single preprocessed image tensor, optionally upsampled with NAF.
+    Run DINO on a single preprocessed image tensor, optionally upsampled with NAF,
+    and optionally augmented with 3D geometric features in the robot base frame.
 
     Args:
-        image_tensor: (1, 3, H, W) float32 torch.Tensor, already on the correct device.
+        image_tensor:  (1, 3, H, W) float32 torch.Tensor, already on the correct device.
         dino_num_layers: number of transformer layers (n parameter for get_intermediate_layers).
-        naf_model: optional NAF upsampler. If provided, features are upsampled by naf_scale.
-        naf_scale: spatial upsampling factor relative to the DINO patch grid (default 1 = no NAF).
+        naf_model:     optional NAF upsampler.
+        naf_scale:     spatial upsampling factor relative to the DINO patch grid.
+        geo_features:  optional (Hp, Wp, 7) float32 array with per-patch geometry:
+                         [0:3] XYZ centroid in robot base frame (mm)
+                         [3:6] surface normal (unit vector)
+                         [  6] depth std within patch (mm)
+                       Must already match the DINO patch grid (after NAF upsampling).
+                       NaN values are treated as 0 (no contribution to cosine similarity).
+        geo_weights:   (alpha, beta, gamma) scaling factors for XYZ, normals, depth-std
+                       before L2-normalizing the augmented vector. Tune to balance
+                       geometric vs semantic contribution.
+        depth_scale:   normalization divisor for XYZ and depth-std (mm). Brings metric
+                       coordinates to a magnitude comparable to DINO features.
 
     Returns:
-        feats: (Hp*naf_scale, Wp*naf_scale, D) float32 numpy array, L2-normalized per patch.
+        feats: (Hp*naf_scale, Wp*naf_scale, D[+7]) float32, L2-normalized per patch.
     """
     with torch.no_grad():
         out = dino_encoder.get_intermediate_layers(
@@ -56,7 +71,17 @@ def _extract_features(
             out = naf_model(image_tensor, out, (Hp * naf_scale, Wp * naf_scale))  # (1, D, Hp*s, Wp*s)
 
     feats = out.squeeze(0).permute(1, 2, 0).float().cpu().numpy()  # (Hp', Wp', D)
-    return _l2_norm(feats)
+    feats = _l2_norm(feats)
+
+    if geo_features is not None:
+        alpha, beta, gamma = geo_weights
+        xyz = np.nan_to_num(geo_features[..., :3]) / depth_scale   # (Hp, Wp, 3)
+        nrm = np.nan_to_num(geo_features[..., 3:6])                # (Hp, Wp, 3) already ≈[-1,1]
+        std = np.nan_to_num(geo_features[..., 6:7]) / depth_scale  # (Hp, Wp, 1)
+        geo_aug = np.concatenate([alpha * xyz, beta * nrm, gamma * std], axis=-1)
+        feats = _l2_norm(np.concatenate([feats, geo_aug], axis=-1))
+
+    return feats
 
 
 def _downsample_label_map(label_map: np.ndarray, Hp: int, Wp: int) -> np.ndarray:
@@ -107,31 +132,46 @@ def build_prototypes(
     class_names: list[str] = ("piece",),
     naf_model=None,
     naf_scale: int = 1,
+    geo_weights: tuple[float, float, float] = (0.3, 0.3, 0.1),
+    depth_scale: float = 1000.0,
 ) -> dict:
     """
     Build multi-class prototypes from an annotated support set.
 
     Args:
-        support_set: list of (image_tensor, label_map) where
-            image_tensor is (1, 3, H, W) float32 on *device*,
+        support_set: list of (image_tensor, label_map) or (image_tensor, label_map, geo_features).
+            image_tensor is (1, 3, H, W) float32 on *device*.
             label_map is (H_orig, W_orig) uint8 with 0=background and i+1=class_names[i].
+            geo_features (optional) is (Hp, Wp, 7) float32 from compute_patch_geo_features,
+                already at the DINO patch grid resolution (after NAF upsampling).
         dino_encoder: loaded DINOv3 model (eval mode).
         dino_num_layers: number of layers to pass to get_intermediate_layers.
         device: torch.device.
         k: number of prototypes per class (reduced if not enough samples).
         class_names: ordered list of foreground class names, e.g. ["base", "welded"].
             Label 1 maps to class_names[0], label 2 to class_names[1], etc.
+        geo_weights: (alpha, beta, gamma) weights for XYZ, normals, depth-std channels.
+        depth_scale: normalization divisor in mm for XYZ and depth-std.
 
     Returns:
-        dict with one (K, D) array per class and "background", plus a merged "foreground"
-        prototype (all fg classes combined) and metadata keys "class_names" and "naf_scale".
+        dict with one (K, D[+7]) array per class and "background", plus a merged "foreground"
+        prototype, and metadata keys "class_names", "naf_scale", "use_depth".
     """
     pools = {name: [] for name in class_names}
     pools["background"] = []
     fg_pool: list = []
 
-    for i, (image_tensor, label_map) in enumerate(support_set):
-        feats = _extract_features(dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale)
+    for item in support_set:
+        if len(item) == 3:
+            image_tensor, label_map, geo_features = item
+        else:
+            image_tensor, label_map = item
+            geo_features = None
+
+        feats = _extract_features(
+            dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale,
+            geo_features=geo_features, geo_weights=geo_weights, depth_scale=depth_scale,
+        )
         Hp, Wp, _ = feats.shape
         patch_labels = _downsample_label_map(label_map, Hp, Wp)  # (Hp, Wp) uint8
 
@@ -157,6 +197,7 @@ def build_prototypes(
     protos["foreground"]  = _cluster(np.concatenate(fg_pool, axis=0), k)
     protos["class_names"] = list(class_names)
     protos["naf_scale"]   = naf_scale
+    protos["use_depth"]   = any(len(item) == 3 for item in support_set)
     return protos
 
 
@@ -182,6 +223,9 @@ def segment(
     min_area: int = 200,
     morph_kernel: int = 5,
     naf_model=None,
+    geo_features: np.ndarray | None = None,
+    geo_weights: tuple[float, float, float] = (0.3, 0.3, 0.1),
+    depth_scale: float = 1000.0,
 ) -> tuple:
     """
     Segment a query image using prototype cosine matching.
@@ -195,6 +239,10 @@ def segment(
         tau: minimum absolute similarity for a foreground class to win over background.
         min_area: minimum connected-component area in pixels (at image resolution).
         morph_kernel: side of the elliptic morphological structuring element.
+        geo_features: optional (Hp, Wp, 7) float32 patch-level geometry for the query.
+            Must match the DINO patch grid (after NAF), same as at build time.
+        geo_weights: (alpha, beta, gamma) for XYZ, normals, depth-std — must match build.
+        depth_scale: normalization divisor in mm — must match build.
 
     Returns:
         label_map: (H, W) uint8 — 0=background, i+1=class_names[i].
@@ -206,7 +254,10 @@ def segment(
     H_img = image_tensor.shape[-2]
     W_img = image_tensor.shape[-1]
 
-    feats = _extract_features(dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale)
+    feats = _extract_features(
+        dino_encoder, image_tensor, dino_num_layers, naf_model, naf_scale,
+        geo_features=geo_features, geo_weights=geo_weights, depth_scale=depth_scale,
+    )
     Hp, Wp, D = feats.shape
     flat = feats.reshape(-1, D).astype(np.float32)  # (N, D)
 

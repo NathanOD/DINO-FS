@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 import os
+import cv2
 import json
 import time
 import torch
 import argparse
 import numpy as np
 from PIL import Image
+from pathlib import Path
 from torchvision.transforms import v2
 from pycocotools import mask as coco_mask
 
 from utils.dataloader import load_config
 from utils.prototypes import load_prototypes, segment
 from utils.visualize import overlay_label_map, compute_mean_iou
+from utils.depth import (
+    load_calibration, load_depth_mm, load_pose,
+    scale_intrinsics, depth_to_base_pointcloud, compute_patch_geo_features,
+)
 
 
 def load_query_tensor(path: str, img_size: int, device: torch.device) -> torch.Tensor:
@@ -59,6 +65,55 @@ def load_coco_label_map(
     return label_map
 
 
+def _derive_depth_path(image_path: str) -> str | None:
+    """Return depth image path from RGB image path (None if not found).
+
+    Convention: 'image_XX.png' → 'depth_XX.png' in the same directory.
+    """
+    p = Path(image_path)
+    depth_name = p.name.replace("image_", "depth_")
+    depth_path = p.parent / depth_name
+    return str(depth_path) if depth_path.exists() else None
+
+
+def _derive_pose_path(image_path: str) -> str | None:
+    """Return robot pose file path from RGB image path (None if not found).
+
+    Convention: 'image_XX.png' → 'pose_XX.txt' in the same directory.
+    """
+    p = Path(image_path)
+    pose_name = p.name.replace("image_", "pose_").replace(".png", ".txt")
+    pose_path = p.parent / pose_name
+    return str(pose_path) if pose_path.exists() else None
+
+
+def load_query_geo_features(
+    query_path: str,
+    img_size: int,
+    T_gc: np.ndarray,
+    intrinsics: dict,
+    feat_size: int,
+) -> np.ndarray | None:
+    """Load depth + pose for the query image and return (feat_size, feat_size, 7) geo features.
+
+    Returns None if no depth image is found alongside the query.
+    """
+    depth_path = _derive_depth_path(query_path)
+    if depth_path is None:
+        return None
+
+    depth_raw = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+    orig_h, orig_w = depth_raw.shape[:2]
+    depth_resized = load_depth_mm(depth_path, target_hw=(img_size, img_size))
+    intr_scaled   = scale_intrinsics(intrinsics, orig_h, orig_w, img_size, img_size)
+
+    pose_path = _derive_pose_path(query_path)
+    T_bg = load_pose(pose_path) if pose_path is not None else None
+
+    pc_base = depth_to_base_pointcloud(depth_resized, intr_scaled, T_gc, T_bg)
+    return compute_patch_geo_features(pc_base, depth_resized, feat_size, feat_size)
+
+
 def run_segment(
     query_path: str,
     img_size: int,
@@ -68,9 +123,26 @@ def run_segment(
     n_layers: int,
     config: dict,
     naf_model=None,
+    T_gc: np.ndarray | None = None,
+    intrinsics: dict | None = None,
+    feat_size: int = 48,
 ) -> tuple[np.ndarray, np.ndarray]:
     query_tensor = load_query_tensor(query_path, img_size, device)
     query_rgb = np.array(Image.open(query_path).convert("RGB"))
+
+    geo_features = None
+    if protos.get("use_depth") and T_gc is not None and intrinsics is not None:
+        geo_features = load_query_geo_features(query_path, img_size, T_gc, intrinsics, feat_size)
+        if geo_features is None:
+            print(f"  Warning: prototypes were built with depth but no depth found for '{query_path}'")
+
+    geo_weights = (
+        config.get("depth_alpha", 0.3),
+        config.get("depth_beta",  0.3),
+        config.get("depth_gamma", 0.1),
+    )
+    depth_scale = config.get("depth_scale", 1000.0)
+
     pred_mask, _ = segment(
         image_tensor=query_tensor,
         protos=protos,
@@ -81,6 +153,9 @@ def run_segment(
         min_area=config["min_area"],
         morph_kernel=config["morph_kernel"],
         naf_model=naf_model,
+        geo_features=geo_features,
+        geo_weights=geo_weights,
+        depth_scale=depth_scale,
     )
     H, W = query_rgb.shape[:2]
     if pred_mask.shape != (H, W):
@@ -116,11 +191,24 @@ def main() -> None:
     print(f"Loading prototypes from '{proto_path}'")
     protos = load_prototypes(proto_path)
     class_names = protos.get("class_names", ["piece"])
-    print(f"Classes: {class_names}  |  bg: {protos['background'].shape}")
+    print(f"Classes: {class_names}  |  bg: {protos['background'].shape}  |  "
+          f"depth: {protos.get('use_depth', False)}")
+
+    # --- Depth calibration (only needed if prototypes were built with depth) ---
+    T_gc, intrinsics = None, None
+    if protos.get("use_depth"):
+        handeye_path    = config.get("handeye_config",    "configs/handeye.yaml")
+        intrinsics_path = config.get("intrinsics_config", "configs/intrinsics.yaml")
+        T_gc, intrinsics = load_calibration(handeye_path, intrinsics_path)
+        print(f"Loaded hand-eye T_gc from '{handeye_path}'")
+
+    patch_size = 16
+    feat_size = (img_size // patch_size) * naf_scale
 
     seg_kwargs = dict(
         img_size=img_size, device=device, dino_encoder=dino_encoder,
         protos=protos, n_layers=n_layers, config=config, naf_model=naf_model,
+        T_gc=T_gc, intrinsics=intrinsics, feat_size=feat_size,
     )
 
     if args.compute_metrics and os.path.isdir(args.query):
