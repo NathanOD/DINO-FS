@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-import os
 import cv2
-import json
 import time
 import torch
 import argparse
@@ -9,11 +7,10 @@ import numpy as np
 from PIL import Image
 from pathlib import Path
 from torchvision.transforms import v2
-from pycocotools import mask as coco_mask
 
 from utils.dataloader import load_config
 from utils.prototypes import load_prototypes, segment
-from utils.visualize import overlay_label_map, compute_mean_iou
+from utils.visualize import overlay_label_map
 from utils.depth import (
     load_calibration, load_depth_mm, load_pose,
     scale_intrinsics, depth_to_base_pointcloud, compute_patch_geo_features,
@@ -29,40 +26,6 @@ def load_query_tensor(path: str, img_size: int, device: torch.device) -> torch.T
     ])
     return transform(Image.open(path).convert("RGB")).unsqueeze(0).to(device)
 
-
-def load_coco_label_map(
-    result_json_path: str,
-    image_filename: str,
-    h: int,
-    w: int,
-    class_names: list[str],
-) -> np.ndarray:
-    """Load a COCO annotation file and return an integer label map (H, W) uint8."""
-    with open(result_json_path) as f:
-        data = json.load(f)
-    images = {img["id"]: img["file_name"] for img in data.get("images", [])}
-    image_id = next(
-        (iid for iid, fname in images.items() if fname == image_filename),
-        None,
-    )
-    if image_id is None:
-        raise ValueError(f"Image '{image_filename}' not found in '{result_json_path}'")
-    cat_name_to_id = {cat["name"]: cat["id"] for cat in data.get("categories", [])}
-    annotations = [a for a in data.get("annotations", []) if a["image_id"] == image_id]
-
-    label_map = np.zeros((h, w), dtype=np.uint8)
-    for j, name in enumerate(class_names):
-        cat_id = cat_name_to_id.get(name)
-        for ann in annotations:
-            if ann.get("category_id") != cat_id:
-                continue
-            seg = ann["segmentation"]
-            if isinstance(seg, dict):
-                rle = seg
-            else:
-                rle = coco_mask.merge(coco_mask.frPyObjects(seg, h, w))
-            label_map[coco_mask.decode(rle).astype(bool)] = j + 1
-    return label_map
 
 
 def _derive_depth_path(image_path: str) -> str | None:
@@ -126,7 +89,11 @@ def run_segment(
     T_gc: np.ndarray | None = None,
     intrinsics: dict | None = None,
     feat_size: int = 48,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Returns (pred_label_map, query_rgb, score_maps).
+
+    score_maps: {class_name: (Hp, Wp) float32} — sim(class)−sim(bg) at patch resolution.
+    """
     query_tensor = load_query_tensor(query_path, img_size, device)
     query_rgb = np.array(Image.open(query_path).convert("RGB"))
 
@@ -143,7 +110,7 @@ def run_segment(
     )
     depth_scale = config.get("depth_scale", 1000.0)
 
-    pred_mask, _ = segment(
+    pred_mask, score_maps = segment(
         image_tensor=query_tensor,
         protos=protos,
         dino_encoder=dino_encoder,
@@ -160,14 +127,13 @@ def run_segment(
     H, W = query_rgb.shape[:2]
     if pred_mask.shape != (H, W):
         pred_mask = np.array(Image.fromarray(pred_mask).resize((W, H), Image.NEAREST))
-    return pred_mask, query_rgb
+    return pred_mask, query_rgb, score_maps
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Few-shot segmentation inference with saved prototypes")
-    parser.add_argument("--query",      required=True, help="Query image path or directory (directory only with --compute_metrics)")
-    parser.add_argument("--config",     default="configs/config_vitb.yaml")
-    parser.add_argument("--compute_metrics", action="store_true", help="Compute IoU from result.json (COCO format) in the query image folder")
+    parser.add_argument("--query",  required=True, help="Query image path")
+    parser.add_argument("--config", default="configs/config_vitb.yaml")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -211,52 +177,12 @@ def main() -> None:
         T_gc=T_gc, intrinsics=intrinsics, feat_size=feat_size,
     )
 
-    if args.compute_metrics and os.path.isdir(args.query):
-        result_json = os.path.join(args.query, "result.json")
-        with open(result_json) as f:
-            coco_data = json.load(f)
-        images = coco_data.get("images", [])
-        if not images:
-            raise ValueError(f"No images listed in '{result_json}'")
+    print(f"Segmenting '{args.query}'")
+    t0 = time.time()
+    pred_label_map, query_rgb, _ = run_segment(args.query, **seg_kwargs)
+    print(f"Inference time: {time.time() - t0:.2f}s")
 
-        all_ious: list[dict] = []
-        for img_info in images:
-            query_path = os.path.join(args.query, img_info["file_name"])
-            print(f"Processing '{img_info['file_name']}' …")
-            t0 = time.time()
-            pred_label_map, query_rgb = run_segment(query_path, **seg_kwargs)
-            elapsed = time.time() - t0
-            H, W = query_rgb.shape[:2]
-            gt_label_map = load_coco_label_map(result_json, img_info["file_name"], H, W, class_names)
-            if gt_label_map.shape != pred_label_map.shape:
-                gt_label_map = np.array(Image.fromarray(gt_label_map).resize(
-                    (pred_label_map.shape[1], pred_label_map.shape[0]), Image.NEAREST
-                ))
-            ious = compute_mean_iou(pred_label_map, gt_label_map, class_names)
-            all_ious.append(ious)
-            iou_str = "  ".join(f"{n}: {v:.4f}" for n, v in ious.items())
-            print(f"  Inference: {elapsed:.2f}s  |  {iou_str}")
-        mean_ious = {n: float(np.mean([d[n] for d in all_ious])) for n in class_names}
-        print(f"\nMean IoU over {len(all_ious)} images: " + "  ".join(f"{n}: {v:.4f}" for n, v in mean_ious.items()))
-
-    else:
-        print(f"Segmenting '{args.query}'")
-        t0 = time.time()
-        pred_label_map, query_rgb = run_segment(args.query, **seg_kwargs)
-        print(f"Inference time: {time.time() - t0:.2f}s")
-
-        H_orig, W_orig = query_rgb.shape[:2]
-        overlay_label_map(query_rgb, pred_label_map, class_names, save_path="result.png")
-
-        if args.compute_metrics:
-            result_json = os.path.join(os.path.dirname(os.path.abspath(args.query)), "result.json")
-            gt_label_map = load_coco_label_map(result_json, os.path.basename(args.query), H_orig, W_orig, class_names)
-            if gt_label_map.shape != pred_label_map.shape:
-                gt_label_map = np.array(Image.fromarray(gt_label_map).resize(
-                    (pred_label_map.shape[1], pred_label_map.shape[0]), Image.NEAREST
-                ))
-            ious = compute_mean_iou(pred_label_map, gt_label_map, class_names)
-            print("IoU vs ground truth: " + "  ".join(f"{n}: {v:.4f}" for n, v in ious.items()))
+    overlay_label_map(query_rgb, pred_label_map, class_names, save_path="result.png")
 
 
 if __name__ == "__main__":
